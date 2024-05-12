@@ -1,0 +1,164 @@
+version: '3'
+
+services:
+  source_postgres:
+    image: postgres:15
+    ports:
+      - "5433:5432"
+    networks:
+      - elt_network
+    environment:
+      POSTGRES_DB: source_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+      # Đường dẫn '/docker-entrypoint-initdb.d/' có ý nghĩa đặc biệt với postgress và hầu hết rdbms khác
+      # Khi container được khởi tạo lần đầu tiên, Postgress tự động thực thi các tệp SQL trong thư mục này
+    volumes:
+      - ./source_db_init/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  destination_postgres:
+    image: postgres:15
+    ports:
+      - "5434:5432"
+    networks:
+      - elt_network
+    environment:
+      POSTGRES_DB: destination_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+
+  # # Khi dùng airflow rồi thì không cần tạo service này nữa, dags script trong airflow sẽ làm việc này
+  # elt_script:
+  #   build:
+  #     context: ./elt
+  #     dockerfile: Dockerfile
+  #   command: ["python3", "elt_script.py"]
+  #   networks:
+  #     - elt_network
+  #   # container này sẽ được build khi tất các cả container dependency của nó đã run thành công
+  #   depends_on:
+  #     - source_postgres
+  #     - destination_postgres
+
+  # # Service này dùng ở bước transform dữ liệu trong data warehouse về model mong muốn
+  # dbt:
+  #   image: ghcr.io/dbt-labs/dbt-postgres:1.7.4
+  #   command:
+  #     [
+  #       "run",
+  #       "--profiles-dir",
+  #       "/root",
+  #       "--project-dir",
+  #       "/dbt",
+  #       "--full-refresh"
+  #     ]
+  #   networks:
+  #     - elt_network
+  #   volumes:
+  #     - ./custom_postgres:/dbt
+  #     - ./.dbt:/root
+  #   depends_on:
+  #     elt_script:
+  #       condition : service_completed_successfully
+  #   environment:
+  #     DBT_PROFILE: default
+  #     DBT_TARGET: dev
+  
+  # Airflow cần 1 database để lưu trữ meta data
+  postgres:
+    image: postgres:15
+    networks:
+      - elt_network
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+
+  # Service dùng để init airflow, sẽ exit = 0 sau khi thực hiện xong init những thứ cần thiết
+  # Cụ thể service này sẽ re account lại tài khoản airflow của DB ở trên theo mong muốn
+  init-airflow:
+    image: apache/airflow:latest
+    depends_on:
+      - postgres
+    networks:
+      - elt_network
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgres+psycopg2://airflow:airflow@postgres/airflow
+    command: >
+      bash -c "airflow db init &&
+              airflow users create --username airflow --password password --firstname Vo --lastname Hoang --role Admin --email vohoang.w2002@gmail.com"
+    
+  # UI cho user access
+  webserver:
+    build: 
+      context: ./airflow
+      dockerfile: Dockerfile
+    user: root
+    depends_on:
+      - postgres
+    networks:
+      - elt_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Cung cấp các dags đã tồn tại cho ui
+      - ./airflow/dags:/opt/airflow/dags
+      # Cung cấp các elt script đã tồn tại cho ui
+      - ./elt:/opt/airflow/elt
+      # Cung cấp các model dbt cho ui
+      - ./custom_postgres:/opt/dbt
+      # Cung cấp profile của dbt cho ui
+      - ./.dbt:/root/.dbt
+      # Cung cấp cho container này quyền truy cập vào docker network
+      - /var/run/docker.sook:/var/run/docker.sock
+    environment:
+      - LOAD_EX=n
+      - EXECUTOR=local
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgres+psycopg2://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__FERNET_KEY=PHW82Bn-JMaEXEIPP2YofwMbZCo_0vYHd8ILDw29M7M=
+      - AIRFLOW__WEBSERVER__DEFAULT__USER_USERNAME=airflow
+      - AIRFLOW__WEBSERVER__DEFAULT__USER_PASSWORD=password
+      - AIRFLOW_WWW_USER_USERNAME=airflow
+      - AIRFLOW_WWW_USER_PASSWORD=password
+      - AIRFLOW__WEBSERVER__SECRET_KEY=secret
+    ports:
+      - "8080:8080"
+    command: webserver
+  
+  # La worker
+  scheduler:
+    build: 
+      context: ./airflow
+      dockerfile: Dockerfile
+    user: root
+    depends_on:
+      - postgres
+    networks:
+      - elt_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Cung cấp các dags đã tồn tại cho ui
+      - ./airflow/dags:/opt/airflow/dags
+      # Cung cấp các elt script đã tồn tại cho ui
+      - ./elt:/opt/airflow/elt
+      # Cung cấp các model dbt cho ui
+      - ./custom_postgres:/opt/dbt
+      # Cung cấp profile của dbt cho ui
+      - ./.dbt:/root/.dbt
+      # Cung cấp cho container này quyền truy cập vào docker network
+      - /var/run/docker.sook:/var/run/docker.sock
+    environment:
+      - LOAD_EX=n
+      - EXECUTOR=local
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgres+psycopg2://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__FERNET_KEY=PHW82Bn-JMaEXEIPP2YofwMbZCo_0vYHd8ILDw29M7M=
+      - AIRFLOW__WEBSERVER__DEFAULT__USER_USERNAME=airflow
+      - AIRFLOW__WEBSERVER__DEFAULT__USER_PASSWORD=password
+      - AIRFLOW_WWW_USER_USERNAME=airflow
+      - AIRFLOW_WWW_USER_PASSWORD=password
+      - AIRFLOW__WEBSERVER__SECRET_KEY=secret
+    command: scheduler
+networks:
+  elt_network:
+    driver: bridge
